@@ -325,6 +325,7 @@ class CosolventSystem(object):
         """
         needs_oxt = set()
         needs_nterm_protons = set()
+        split_before = set()  # residues that must start a NEW chain object
         for c_res, n_res in broken_pairs:
             c_names = {a.name for a in c_res.atoms()}
             if "OXT" not in c_names and {"C", "O", "CA"} <= c_names:
@@ -332,8 +333,26 @@ class CosolventSystem(object):
             n_names = {a.name for a in n_res.atoms()}
             if len(n_names & {"H", "H1", "H2", "H3"}) < 3 and {"N", "CA"} <= n_names:
                 needs_nterm_protons.add(n_res)
+            # The atom-composition fixes above are enough for THIS process's
+            # ForceField.createSystem() call, since it consults the in-memory
+            # topology._bonds list directly. They are NOT enough to survive a
+            # PDB round-trip: app.PDBFile.__init__ always calls
+            # createStandardBonds() on load, which bonds by chain-list
+            # residue ADJACENCY -- if c_res and n_res are still sitting in
+            # the same Chain object (i.e. addSolvent's rebuild merged the
+            # deliberate chain split, which is the actual root cause here),
+            # any later fresh parse of the written PDB (or an equivalent
+            # in-memory reparse-based check) silently re-derives the exact
+            # bond just stripped, undoing this fix invisibly (confirmed
+            # empirically 260813: scripts/diagnostics/check_backbone_
+            # connectivity.py re-flagged the same GLU315->THR316 gap on the
+            # WRITTEN _cosolv.pdb even after this repair ran cleanly
+            # in-process). Splitting the chain object itself -- not just
+            # fixing atom counts -- is required for round-trip safety.
+            if c_res.chain is n_res.chain:
+                split_before.add(n_res)
 
-        if not needs_oxt and not needs_nterm_protons:
+        if not needs_oxt and not needs_nterm_protons and not split_before:
             return []
 
         topology = self.modeller.topology
@@ -356,6 +375,13 @@ class CosolventSystem(object):
         for chain in topology.chains():
             new_chain = new_top.addChain(id=chain.id)
             for residue in chain.residues():
+                if residue in split_before:
+                    new_chain = new_top.addChain(id=chain.id)
+                    messages.append(
+                        f"chain {chain.id}: split chain before {residue.name}{residue.id} "
+                        "(newly exposed N-terminus after addSolvent bond strip -- "
+                        "addSolvent had merged this back into its C-side neighbor's chain)"
+                    )
                 new_residue = new_top.addResidue(residue.name, new_chain, id=residue.id)
                 by_name = {}
                 for atom in residue.atoms():

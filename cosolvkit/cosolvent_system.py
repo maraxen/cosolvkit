@@ -229,8 +229,58 @@ class CosolventSystem(object):
         return
     
 #region Public
+    def _repair_anomalous_standard_bonds(self, max_bond_angstrom: float = 2.0) -> list:
+        """Remove any standard C-N bond whose actual 3D distance is anomalously large.
+
+        naurmalade fork fix (backlog #3958, debt #1244). ``Modeller.addSolvent``
+        internally rebuilds the topology to add the water/ion box, and in doing
+        so can merge/renumber chains -- an input topology with a deliberate
+        chain break (a receptor built with a resSeq gap left as a real chain
+        boundary, so ``createStandardBonds`` never bonds across it) can come out
+        of ``addSolvent`` with that break silently gone, re-exposing the exact
+        artificial-bond problem the caller's chain split was meant to prevent.
+        This is a property of ``Modeller.addSolvent`` rebuilding the topology,
+        not a resSeq/chain-id bug in this class's own code -- so the fix here
+        is distance-based (real physical bond length), not resSeq-based
+        (unreliable once addSolvent has already renumbered everything).
+
+        Called automatically after every ``addSolvent`` call in ``build()``.
+        Safe to call on a topology with no such bonds (no-op).
+
+        :param max_bond_angstrom: bonds longer than this are treated as
+            artificial and removed, defaults to 2.0 (a real peptide C-N bond
+            is ~1.33A; anything past 2.0A cannot be a real bond).
+        :type max_bond_angstrom: float, optional
+        :return: human-readable messages, one per bond removed
+        :rtype: list
+        """
+        topology = self.modeller.topology
+        positions_nm = np.array(self.modeller.positions.value_in_unit(openmmunit.nanometer))
+        max_bond_nm = max_bond_angstrom / 10.0
+
+        messages = []
+        keep = []
+        for bond in topology._bonds:
+            atom1, atom2 = bond[0], bond[1]
+            if {atom1.name, atom2.name} == {"C", "N"} and atom1.residue != atom2.residue:
+                d = float(np.linalg.norm(positions_nm[atom1.index] - positions_nm[atom2.index]))
+                if d > max_bond_nm:
+                    messages.append(
+                        f"chain {atom1.residue.chain.id}: removed anomalous standard bond "
+                        f"{atom1.residue.name}{atom1.residue.id} ({atom1.name}) -> "
+                        f"{atom2.residue.name}{atom2.residue.id} ({atom2.name}), d={d * 10.0:.2f}A "
+                        f"(addSolvent-introduced, not a real peptide bond)"
+                    )
+                    continue
+            keep.append(bond)
+        if messages:
+            topology._bonds = keep
+            for msg in messages:
+                print(f"[cosolvkit] {msg}")
+        return messages
+
     def build(self,
-              solvent_smiles: str="H2O", 
+              solvent_smiles: str="H2O",
               n_solvent_molecules: int=None,
               neutralize: bool=True,
               iteratively_adjust_copies: bool=False):
@@ -261,6 +311,7 @@ class CosolventSystem(object):
             if n_solvent_molecules is None: self.modeller.addSolvent(self.forcefield, neutralize=neutralize)
             else: self.modeller.addSolvent(self.forcefield, numAdded=n_solvent_molecules, neutralize=neutralize)
             print(f"Waters added: {self._get_n_waters()}")
+            self._repair_anomalous_standard_bonds()
         elif solvent_smiles is not None:
             c = {"name": "solvent",
                  "smiles": solvent_smiles}

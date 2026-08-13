@@ -1,0 +1,33 @@
+[project]
+name = "cosolvkit"
+version = "0.5.0"
+description = "CosolvKit"
+readme = "README.md"
+license = "LGPL-2.1-only"
+authors = [
+    { name = "Niccolo Bruciaferri, Jerome Eberhardt", email = "forli@scripps.edu" },
+]
+requires-python = ">=3.10"
+# Deliberately no `dependencies` list here: upstream never declared explicit
+# install_requires (see setup.py) -- its real dependency set (openff-toolkit,
+# pymol-open-source, ambertools, etc.) is conda-forge-only and documented in
+# environment.yml, not resolvable via pip/uv at all. naurmalade's own
+# `cosolv` extra supplies the pip-installable subset (parmed, MDAnalysis);
+# the rest come from a separate micromamba env, see
+# scripts/cluster/run_naurmalade_isolated_openff.py. This is a fork
+# (maraxen/cosolvkit, forked from forlilab/cosolvkit) vendored as a naurmalade
+# git submodule + uv workspace member specifically to patch bugs found in
+# naurmalade's own usage (backlog #3958, debt #1244: cosolvkit's
+# CosolventSystem.build() re-merges/renumbers a multi-chain input topology,
+# silently discarding an upstream chain-break fix).
+
+[project.scripts]
+create_cosolvent_system = "cosolvkit.cli.create_cosolvent_system:main"
+post_simulation_processing = "cosolvkit.cli.post_simulation_processing:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cosolvkit"]

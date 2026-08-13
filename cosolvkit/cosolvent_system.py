@@ -12,6 +12,7 @@ from itertools import product
 import parmed
 from openmm import Vec3, unit, XmlSerializer, System, CustomNonbondedForce, NonbondedForce, OpenMMException
 import openmm.app as app
+from openmm.app import element
 import openmm.unit as openmmunit
 import rdkit
 from rdkit import Chem
@@ -251,7 +252,7 @@ class CosolventSystem(object):
             artificial and removed, defaults to 2.0 (a real peptide C-N bond
             is ~1.33A; anything past 2.0A cannot be a real bond).
         :type max_bond_angstrom: float, optional
-        :return: human-readable messages, one per bond removed
+        :return: human-readable messages, one per bond removed or atom added
         :rtype: list
         """
         topology = self.modeller.topology
@@ -260,23 +261,168 @@ class CosolventSystem(object):
 
         messages = []
         keep = []
+        broken_pairs = []  # (c_side_residue, n_side_residue) per bond removed
         for bond in topology._bonds:
             atom1, atom2 = bond[0], bond[1]
             if {atom1.name, atom2.name} == {"C", "N"} and atom1.residue != atom2.residue:
                 d = float(np.linalg.norm(positions_nm[atom1.index] - positions_nm[atom2.index]))
                 if d > max_bond_nm:
+                    c_atom, n_atom = (atom1, atom2) if atom1.name == "C" else (atom2, atom1)
                     messages.append(
                         f"chain {atom1.residue.chain.id}: removed anomalous standard bond "
                         f"{atom1.residue.name}{atom1.residue.id} ({atom1.name}) -> "
                         f"{atom2.residue.name}{atom2.residue.id} ({atom2.name}), d={d * 10.0:.2f}A "
                         f"(addSolvent-introduced, not a real peptide bond)"
                     )
+                    broken_pairs.append((c_atom.residue, n_atom.residue))
                     continue
             keep.append(bond)
         if messages:
             topology._bonds = keep
             for msg in messages:
                 print(f"[cosolvkit] {msg}")
+        if broken_pairs:
+            messages.extend(self._restore_terminal_chemistry(broken_pairs))
+        return messages
+
+    def _restore_terminal_chemistry(self, broken_pairs: list) -> list:
+        """Restore OXT / N-terminal protons at residues newly exposed by
+        ``_repair_anomalous_standard_bonds`` stripping an addSolvent-introduced bond.
+
+        Stripping the bond alone leaves both flanking residues matching no
+        valid AMBER template: the C-side residue is missing OXT (a real
+        chain terminus needs it, an internal residue doesn't), and the
+        N-side residue still carries only its single internal backbone
+        amide H rather than the three protons (NH3+) a real N-terminus
+        needs. ``ForceField.createSystem`` then fails with "Did not
+        recognize residue ..." (backlog #3958, debt #1244) -- the exact
+        same class of bug already found and fixed once in naurmalade's own
+        ``src/naurmalade/solvate.py::_add_c_terminal_oxt``, now recurring
+        one stage later because ``Modeller.addSolvent`` rebuilds the
+        topology and re-exposes the chain break that upstream's own OXT fix
+        had already correctly handled.
+
+        Mirrors ``_add_c_terminal_oxt``'s OXT placement exactly (reflect O
+        across the CA->C axis, in the CA-C-O plane -- NOT point-reflection
+        through C, which gives a 180-degree angle singularity) and, for the
+        N-terminal side, places the two additional protons by rotating the
+        residue's existing backbone amide H +-120 degrees around the N->CA
+        axis -- the standard staggered-tetrahedral NH3+ placement used by
+        capping tools like tleap/PDBFixer when a new N-terminus is created.
+
+        Rebuilds the whole topology atom-by-atom rather than mutating in
+        place, for the same reason as ``_add_c_terminal_oxt``:
+        ``Topology.addAtom`` only ever appends to the topology's overall-last
+        atom, and by this point in ``build()`` the topology contains the
+        full solvated system (tens of thousands of water molecules), so the
+        two residues needing new atoms are essentially never last.
+
+        :param broken_pairs: list of (c_side_residue, n_side_residue) tuples,
+            one per bond ``_repair_anomalous_standard_bonds`` just removed.
+        :type broken_pairs: list
+        :return: human-readable messages, one per residue repaired
+        :rtype: list
+        """
+        needs_oxt = set()
+        needs_nterm_protons = set()
+        for c_res, n_res in broken_pairs:
+            c_names = {a.name for a in c_res.atoms()}
+            if "OXT" not in c_names and {"C", "O", "CA"} <= c_names:
+                needs_oxt.add(c_res)
+            n_names = {a.name for a in n_res.atoms()}
+            if len(n_names & {"H", "H1", "H2", "H3"}) < 3 and {"N", "CA"} <= n_names:
+                needs_nterm_protons.add(n_res)
+
+        if not needs_oxt and not needs_nterm_protons:
+            return []
+
+        topology = self.modeller.topology
+        coords_nm = list(self.modeller.positions.value_in_unit(openmmunit.nanometer))
+
+        def _rotate(v, axis, degrees):
+            theta = np.radians(degrees)
+            return (
+                v * np.cos(theta)
+                + np.cross(axis, v) * np.sin(theta)
+                + axis * np.dot(axis, v) * (1 - np.cos(theta))
+            )
+
+        new_top = app.Topology()
+        new_coords = []
+        atom_map = {}
+        extra_bonds = []  # (new_atom_a, new_atom_b)
+        messages = []
+
+        for chain in topology.chains():
+            new_chain = new_top.addChain(id=chain.id)
+            for residue in chain.residues():
+                new_residue = new_top.addResidue(residue.name, new_chain, id=residue.id)
+                by_name = {}
+                for atom in residue.atoms():
+                    new_atom = new_top.addAtom(atom.name, atom.element, new_residue, id=atom.id)
+                    atom_map[atom] = new_atom
+                    new_coords.append(coords_nm[atom.index])
+                    by_name[atom.name] = atom
+
+                if residue in needs_oxt:
+                    cvec = np.array(coords_nm[by_name["C"].index])
+                    ovec = np.array(coords_nm[by_name["O"].index])
+                    ca_vec = np.array(coords_nm[by_name["CA"].index])
+                    axis = cvec - ca_vec
+                    axis_norm = axis / np.linalg.norm(axis)
+                    d = ovec - cvec
+                    d_parallel = np.dot(d, axis_norm) * axis_norm
+                    d_perp = d - d_parallel
+                    oxt_vec = Vec3(*(cvec + d_parallel - d_perp))
+                    new_oxt = new_top.addAtom("OXT", element.oxygen, new_residue)
+                    new_coords.append(oxt_vec)
+                    extra_bonds.append((atom_map[by_name["C"]], new_oxt))
+                    messages.append(
+                        f"chain {chain.id}: added OXT to {residue.name}{residue.id} "
+                        "(newly exposed C-terminus after addSolvent bond strip)"
+                    )
+
+                if residue in needs_nterm_protons:
+                    n_vec = np.array(coords_nm[by_name["N"].index])
+                    ca_vec = np.array(coords_nm[by_name["CA"].index])
+                    axis = n_vec - ca_vec
+                    axis_norm = axis / np.linalg.norm(axis)
+
+                    existing_h = by_name.get("H") or by_name.get("H1")
+                    if existing_h is not None:
+                        h_vec = np.array(coords_nm[existing_h.index]) - n_vec
+                    else:
+                        arbitrary = np.array([1.0, 0.0, 0.0])
+                        if abs(np.dot(arbitrary, axis_norm)) > 0.9:
+                            arbitrary = np.array([0.0, 1.0, 0.0])
+                        perp = arbitrary - np.dot(arbitrary, axis_norm) * axis_norm
+                        h_vec = (perp / np.linalg.norm(perp)) * 0.101  # ~1.01A N-H bond, nm
+                        new_h1_vec = Vec3(*(n_vec + h_vec))
+                        new_h1 = new_top.addAtom("H1", element.hydrogen, new_residue)
+                        new_coords.append(new_h1_vec)
+                        extra_bonds.append((atom_map[by_name["N"]], new_h1))
+
+                    for label, angle in (("H2", 120.0), ("H3", -120.0)):
+                        rotated = _rotate(h_vec, axis_norm, angle)
+                        new_h_vec = Vec3(*(n_vec + rotated))
+                        new_h_atom = new_top.addAtom(label, element.hydrogen, new_residue)
+                        new_coords.append(new_h_vec)
+                        extra_bonds.append((atom_map[by_name["N"]], new_h_atom))
+                    messages.append(
+                        f"chain {chain.id}: added N-terminal protons to {residue.name}{residue.id} "
+                        "(newly exposed N-terminus after addSolvent bond strip)"
+                    )
+
+        for bond in topology.bonds():
+            atom1, atom2 = bond[0], bond[1]
+            new_top.addBond(atom_map[atom1], atom_map[atom2])
+        for a, b in extra_bonds:
+            new_top.addBond(a, b)
+
+        new_top.setPeriodicBoxVectors(topology.getPeriodicBoxVectors())
+        self.modeller = app.Modeller(new_top, new_coords)
+        for msg in messages:
+            print(f"[cosolvkit] {msg}")
         return messages
 
     def build(self,

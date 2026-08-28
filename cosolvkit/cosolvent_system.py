@@ -455,7 +455,8 @@ class CosolventSystem(object):
               solvent_smiles: str="H2O",
               n_solvent_molecules: int=None,
               neutralize: bool=True,
-              iteratively_adjust_copies: bool=False):
+              iteratively_adjust_copies: bool=False,
+              ionic_strength_molar: float=0.0):
         """This function adds the cosolvents specified in the CosolvSystem
         and solvates with the desired solvent. If n_solvent_molecules is not passed
         the function will try to fill the box with the desired solvent to a certain extent.
@@ -469,7 +470,13 @@ class CosolventSystem(object):
         :param neutralize: if True, the system charge will be neutralized by OpenMM, defaults to True
         :type neutralize: bool, optional
         :param iteratively_adjust_copies: if True, the number of copies of each cosolvent will iteratively be reduced until a valid starting configuration is found
-        :type iteratively_adjust_copies: bool, optional 
+        :type iteratively_adjust_copies: bool, optional
+        :param ionic_strength_molar: bulk NaCl concentration (mol/L) added on top of
+            any neutralizing counterions, only applied for the solvent_smiles=="H2O"
+            path (addSolvent's own ionicStrength kwarg -- meaningless for a
+            non-water solvent). Default 0.0 preserves prior behavior (neutralizing
+            ions only, no bulk salt) for callers that don't pass it.
+        :type ionic_strength_molar: float, optional
         """
         volume_not_occupied_by_cosolvent = self.fitting_checks()
         assert volume_not_occupied_by_cosolvent is not None, "The requested volume for the cosolvents exceeds the available volume! Please try increasing the box padding or radius."
@@ -480,8 +487,14 @@ class CosolventSystem(object):
             cosolv_xyzs = self.add_cosolvents(self.cosolvents, self.vectors, self.lowerBound, self.upperBound, receptor_positions)
         self.modeller = self._setup_new_topology(cosolv_xyzs, self.modeller.topology, self.modeller.positions)
         if solvent_smiles == "H2O":
-            if n_solvent_molecules is None: self.modeller.addSolvent(self.forcefield, neutralize=neutralize)
-            else: self.modeller.addSolvent(self.forcefield, numAdded=n_solvent_molecules, neutralize=neutralize)
+            solvate_kwargs = dict(
+                neutralize=neutralize,
+                positiveIon="Na+",
+                negativeIon="Cl-",
+                ionicStrength=ionic_strength_molar * openmmunit.molar,
+            )
+            if n_solvent_molecules is None: self.modeller.addSolvent(self.forcefield, **solvate_kwargs)
+            else: self.modeller.addSolvent(self.forcefield, numAdded=n_solvent_molecules, **solvate_kwargs)
             print(f"Waters added: {self._get_n_waters()}")
             self._repair_anomalous_standard_bonds()
         elif solvent_smiles is not None:

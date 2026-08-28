@@ -1546,13 +1546,18 @@ class CosolventMembraneSystem(CosolventSystem):
         self._periodic_box_vectors = self.modeller.topology.getPeriodicBoxVectors().value_in_unit(openmmunit.nanometer)
         return
 
-    def build(self, neutralize: bool=True, iteratively_adjust_copies: bool=False):
+    def build(self, neutralize: bool=True, iteratively_adjust_copies: bool=False,
+              ionic_strength_molar: float=0.0):
         """Adds the cosolvent molecules to the system
 
         :param neutralize: if neutralize the system during solvation, defaults to True
         :type neutralize: bool, optional
         :param iteratively_adjust_copies: if True, the number of copies of each cosolvent will iteratively be reduced until a valid starting configuration is found
-        :type iteratively_adjust_copies: bool, optional 
+        :type iteratively_adjust_copies: bool, optional
+        :param ionic_strength_molar: bulk NaCl concentration (mol/L) added on top of
+            any neutralizing counterions. Default 0.0 preserves prior behavior
+            (neutralizing ions only, no bulk salt) for callers that don't pass it.
+        :type ionic_strength_molar: float, optional
         """
         if self._cosolvent_placement != 0:
             lipid_positions = list()
@@ -1581,8 +1586,14 @@ class CosolventMembraneSystem(CosolventSystem):
         else:
             cosolv_xyzs = self.add_cosolvents(self.cosolvents, self.vectors, lowerBound, upperBound, receptor_positions)
         self.modeller = self._setup_new_topology(cosolv_xyzs, self.modeller.topology, self.modeller.positions)
-        self.modeller.addSolvent(forcefield=self.forcefield, neutralize=neutralize)
-            
+        self.modeller.addSolvent(
+            forcefield=self.forcefield,
+            neutralize=neutralize,
+            positiveIon="Na+",
+            negativeIon="Cl-",
+            ionicStrength=ionic_strength_molar * openmmunit.molar,
+        )
+
         self.system = self._create_system(self.forcefield, self.modeller.topology)
         return
-        
+

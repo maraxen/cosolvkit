@@ -27,7 +27,9 @@ from pymol import cmd, stored
 from cosolvkit.cosolvent_system import CosolventMolecule
 
 
-BOLTZMANN_CONSTANT_KB = 0.0019872041
+BOLTZMANN_CONSTANT_KB = 0.0019872041  # kcal/(mol K)
+# Box volumes from the MD statistics are in nm^3; voxels are in Angstrom^3.
+NM3_TO_A3 = 1000.0
 
 
 def _normalization(data, a=0, b=0):
@@ -70,12 +72,30 @@ def _smooth_grid_free_energy(gfe, sigma=1):
     return gfe
 
 
-def _grid_free_energy(hist, volume_water, gridsize, n_atoms, n_frames, temperature=300.):
+def _grid_free_energy(hist, box_volume_nm3, gridsize, n_atoms, n_frames, temperature=300.):
+    """Atomic grid free energy from a histogram of solute occupancy.
+
+    Units: gridsize in Angstrom, box_volume_nm3 in nm^3, temperature in K,
+    returned value in kcal/mol.
+
+    The bulk reference density uses the WHOLE simulation box volume as the
+    solvent volume. This is a known limitation: it is not the volume of water
+    alone, and the protein volume is not excluded.
+
+    :param hist: occupancy histogram per voxel, summed over frames.
+    :param box_volume_nm3: box volume in nm^3 (mean over the statistics rows).
+    :param gridsize: voxel edge length in Angstrom.
+    :param n_atoms: number of solute atoms counted in the histogram.
+    :param n_frames: number of frames in the histogram.
+    :param temperature: temperature in K.
+    :return: grid free energy per voxel, in kcal/mol.
+    """
     # Avoid 0 in the histogram for the log function
     hist = hist + 1E-20
-    # The volume here is the volume of water and not the entire box
+    # Convert the box volume to Angstrom^3 so it matches the voxel volume.
+    box_volume_a3 = box_volume_nm3 * NM3_TO_A3
     volume_voxel = gridsize **3
-    n_voxel = volume_water / volume_voxel
+    n_voxel = box_volume_a3 / volume_voxel
     # Probability of the solute in the bulk (without protein)
     N_o = n_atoms / n_voxel
     # Probability of the solute (with the protein)
@@ -200,10 +220,16 @@ class Analysis(AnalysisBase):
         positions = positions.reshape(new_shape)
         return positions
 
-    def atomic_grid_free_energy(self, volume, temperature=300., atom_radius=1.4, smoothing=True):
+    def atomic_grid_free_energy(self, box_volume_nm3, temperature=300., atom_radius=1.4, smoothing=True):
         """Compute grid free energy.
+
+        Units: box_volume_nm3 in nm^3, temperature in K, atom_radius in Angstrom.
+        The result is stored as kcal/mol.
+
+        :param box_volume_nm3: whole-box volume in nm^3 (see _grid_free_energy).
+        :type box_volume_nm3: float
         """
-        agfe = _grid_free_energy(self._histogram.grid, volume, self._gridsize, self._n_atoms, self._nframes, temperature)
+        agfe = _grid_free_energy(self._histogram.grid, box_volume_nm3, self._gridsize, self._n_atoms, self._nframes, temperature)
 
         if smoothing:
             # We divide by 3 in order to have radius == 3 sigma
@@ -287,21 +313,22 @@ class Report:
         """
         print("Generating density maps...")
         os.makedirs(out_path, exist_ok=True)
-        volume = self._volume[-1]
+        # Mean whole-box volume (nm^3) over the statistics rows, not only the last frame.
+        box_volume_nm3 = float(np.mean(self._volume))
         temperature = self._temperature[-1]
         if analysis_selection_string == "":
             print("No cosolvent specified for the densities analysis. Generating a density map for each cosolvent.")
             for cosolvent in self.cosolvents:
                 selection_string = f"resname {cosolvent.resname}"
                 self._run_analysis(selection_string=selection_string,
-                                   volume=volume,
+                                   box_volume_nm3=box_volume_nm3,
                                    temperature=temperature,
                                    out_path=out_path,
                                    cosolvent_name=cosolvent.resname)
         else:
             print(f"Generating density maps for the following selection string: {analysis_selection_string}")
             self._run_analysis(selection_string=analysis_selection_string, 
-                               volume=volume,
+                               box_volume_nm3=box_volume_nm3,
                                temperature=temperature,
                                out_path=out_path,
                                cosolvent_name=None)
@@ -389,13 +416,13 @@ class Report:
         cmd.save(os.path.join(out_path, "pymol_results_session.pse"))
         return
     
-    def _run_analysis(self, selection_string, volume, temperature, out_path, cosolvent_name=None):
+    def _run_analysis(self, selection_string, box_volume_nm3, temperature, out_path, cosolvent_name=None):
         """Creates Analysis object and generates densities.
 
         :param selection_string: MD Analysis selection string.
         :type selection_string: str
-        :param volume: volume of the system.
-        :type volume: float
+        :param box_volume_nm3: whole-box volume of the system in nm^3.
+        :type box_volume_nm3: float
         :param temperature: temperature of the system.
         :type temperature: float
         :param out_path: path to where to save the results.
@@ -410,7 +437,7 @@ class Report:
             fig_energy_name =  os.path.join(out_path, f"map_agfe_{cosolvent_name}.dx")
         analysis = Analysis(self.universe.select_atoms(selection_string), verbose=True)
         analysis.run()
-        analysis.atomic_grid_free_energy(volume, temperature)
+        analysis.atomic_grid_free_energy(box_volume_nm3, temperature)
         analysis.export_density(fig_density_name)
         analysis.export_atomic_grid_free_energy(fig_energy_name)
         self.density_file = fig_density_name
